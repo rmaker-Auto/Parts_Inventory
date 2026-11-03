@@ -943,28 +943,81 @@ function applyAppNameIcon(){
   const st = document.getElementById('appIconStatusLine');
   if(st) st.textContent = '✅ প্রয়োগ করা হয়েছে';
 }
-const PWA_SW_SOURCE = `/* Parts Inventory — offline support.
-   App files: network first (so a new version you upload to GitHub shows up as soon as you are online),
-   falling back to the saved copy when offline. Google/Drive/Apps Script requests are never touched. */
-const CACHE = 'pi-cache-v3';
+const PWA_SW_SOURCE = `/* Parts Inventory — offline support (v4).
+   - The app page and its files are saved on the device the first time they load online.
+   - Online: the newest version is fetched (waits at most 4 s on a slow/bad connection), then saved again.
+   - Offline (or very slow): the saved copy opens instantly, so the app works with no internet.
+   Google / Drive / Apps Script requests (other origins) are never touched. */
+const CACHE = 'pi-cache-v4';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
-self.addEventListener('install', e=>{
-  e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL).catch(()=>{})).then(()=>self.skipWaiting()));
+
+self.addEventListener('install', e => {
+  e.waitUntil((async () => {
+    const c = await caches.open(CACHE);
+    // one by one: a single missing file must not stop the others from being saved
+    await Promise.all(SHELL.map(async u => {
+      try {
+        const r = await fetch(new Request(u, { cache: 'reload' }));
+        if (r && r.ok) await c.put(u, r);
+      } catch (err) { /* ignore */ }
+    }));
+    await self.skipWaiting();
+  })());
 });
-self.addEventListener('activate', e=>{
-  e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));
+
+self.addEventListener('activate', e => {
+  e.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)));
+    await self.clients.claim();
+  })());
 });
-self.addEventListener('fetch', e=>{
+
+function timedFetch(req, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    fetch(req).then(r => { clearTimeout(t); resolve(r); }, err => { clearTimeout(t); reject(err); });
+  });
+}
+
+async function pageHandler(req) {
+  const cache = await caches.open(CACHE);
+  try {
+    const res = await timedFetch(req, 4000);
+    if (res && res.ok && res.type === 'basic') {
+      cache.put('index.html', res.clone()).catch(() => {});
+      cache.put('./', res.clone()).catch(() => {});
+    }
+    return res;
+  } catch (err) {
+    const hit = (await cache.match('index.html', { ignoreSearch: true }))
+             || (await cache.match('./', { ignoreSearch: true }))
+             || (await caches.match(req, { ignoreSearch: true }));
+    if (hit) return hit;
+    return new Response('<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;padding:24px;background:#0f1621;color:#fff"><h3>অফলাইন</h3><p>অ্যাপটি এই ডিভাইসে এখনো সেভ হয়নি। একবার ইন্টারনেট চালু করে অ্যাপটি খুলুন।</p></body>',
+      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  }
+}
+
+async function assetHandler(req) {
+  const cache = await caches.open(CACHE);
+  try {
+    const res = await timedFetch(req, 4000);
+    if (res && res.ok && res.type === 'basic') cache.put(req, res.clone()).catch(() => {});
+    return res;
+  } catch (err) {
+    const hit = await cache.match(req, { ignoreSearch: true });
+    return hit || Response.error();
+  }
+}
+
+self.addEventListener('fetch', e => {
   const req = e.request;
-  if(req.method !== 'GET') return;
+  if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if(url.origin !== self.location.origin) return;
-  e.respondWith(
-    fetch(req).then(res=>{
-      if(res && res.status===200){ const copy = res.clone(); caches.open(CACHE).then(c=>c.put(req, copy)); }
-      return res;
-    }).catch(()=>caches.match(req).then(hit=>hit || (req.mode==='navigate' ? caches.match('index.html') || caches.match('./') : Response.error())))
-  );
+  if (url.origin !== self.location.origin) return;
+  if (req.mode === 'navigate') e.respondWith(pageHandler(req));
+  else e.respondWith(assetHandler(req));
 });
 `;
 async function downloadPWAFiles(){
@@ -1477,12 +1530,14 @@ function offlineStatusHTML(){
     <div>🌐 ইন্টারনেট: <b>${online?'আছে':'নেই'}</b></div>
     <div>⏳ সিঙ্কের অপেক্ষায় ডাটা: <b>${pending?pending+' টি':'নেই'}</b></div>
     <div>📴 অফলাইন মোড: <b>প্রস্তুত (ডাটা এই ডিভাইসেই সেভ থাকে)</b></div>
+    <div>📦 অফলাইনে অ্যাপ খোলা: <b id="swStatusTxt">${swStatusText()}</b></div>
     <div>💾 স্থায়ী স্টোরেজ: <b id="persistStatusTxt">${navigator.storage&&navigator.storage.persisted ? '...':'অজানা'}</b></div>
   `;
 }
 function refreshOfflineStatus(){
   const box = document.getElementById('offlineStatusBox');
   if(box) box.innerHTML = offlineStatusHTML();
+  checkOfflineCache();
   if(navigator.storage && navigator.storage.persisted){
     navigator.storage.persisted().then(p=>{ const el=document.getElementById('persistStatusTxt'); if(el) el.textContent = p?'অনুমোদিত':'অনুমোদিত নয়'; });
   }
@@ -3972,10 +4027,28 @@ function initApp(){
 /* PWA install support — registers sw.js only when actually served over
    http(s) (GitHub Pages etc.); silently skipped when opened as a local
    file:// page, where service workers aren't available anyway. */
+let __swState = 'checking';
 if('serviceWorker' in navigator && location.protocol.indexOf('http')===0){
   window.addEventListener('load', ()=>{
-    navigator.serviceWorker.register('sw.js').catch(()=>{ /* sw.js not uploaded yet — fine, app still works */ });
+    navigator.serviceWorker.register('sw.js').then(reg=>{
+      try{ reg.update(); }catch(e){}
+      return navigator.serviceWorker.ready;
+    }).then(()=>{ __swState='ok'; checkOfflineCache(); }).catch(err=>{ __swState='fail:'+((err&&err.message)||err); checkOfflineCache(); });
   });
+} else { __swState = 'unsupported'; }
+async function checkOfflineCache(){
+  let cached = false;
+  try{ if(window.caches){ const m = await caches.match('index.html', {ignoreSearch:true}) || await caches.match('./', {ignoreSearch:true}); cached = !!m; } }catch(e){}
+  window.__offlineCached = cached;
+  const el = document.getElementById('swStatusTxt');
+  if(el) el.innerHTML = swStatusText();
+}
+function swStatusText(){
+  if(location.protocol==='file:') return '❌ ফাইল (file://) থেকে খোলা — GitHub Pages থেকে খুলুন';
+  if(__swState==='unsupported') return '❌ এই ব্রাউজারে সমর্থিত নয়';
+  if(__swState.indexOf('fail:')===0) return '❌ সার্ভিস ওয়ার্কার চালু হয়নি (sw.js GitHub-এ আছে কিনা দেখুন) — '+escapeHTML(__swState.slice(5));
+  if(window.__offlineCached) return '✅ অ্যাপ ফাইল এই ডিভাইসে সেভ আছে — ইন্টারনেট ছাড়াই খুলবে';
+  return '⏳ সেভ হচ্ছে... — ইন্টারনেট চালু রেখে অ্যাপটি একবার পুরো খুলে অপেক্ষা করুন';
 }
 window.addEventListener('load', ()=>{
   if(getActiveProfileId() && loadProfiles().some(p=>p.id===getActiveProfileId())){
